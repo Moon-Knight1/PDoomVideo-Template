@@ -45,6 +45,7 @@ The video took two generations, both in Claude Code:
 | [`STORYBOARD.md`](STORYBOARD.md) | Opus's shot-by-shot plan |
 | [`ANIMATION_GUIDE.md`](ANIMATION_GUIDE.md) | Opus's style and code guide for its subagents |
 | [`legacy/`](legacy/) | The first generation |
+| [`songs/`](songs/) | One folder per song MV — copy `songs/_template/` to start a new one |
 
 ## Rendering
 
@@ -56,4 +57,19 @@ node render.mjs --frames=0:156.6 --workers=4   # paint every frame into out/fram
 node render.mjs --encode --out=out/pdoom.mp4   # join the frames and the song into an MP4
 ```
 
-If Chrome isn't installed at the default Windows path, add `--chrome=<path to chrome>`.
+Chrome is found automatically, in this order:
+
+1. `--chrome=<path>` / `CHROME=<path>` / `PUPPETEER_EXECUTABLE_PATH=<path>`
+2. system installs (`google-chrome`, `chromium`, …; on Windows the default Program Files paths)
+3. a local `.chrome/` or `~/.cache/puppeteer` download
+
+No Chrome at all? Let puppeteer fetch one:
+
+```bash
+PUPPETEER_CACHE_DIR=.chrome npx puppeteer browsers install chrome@stable            # full Chrome (uses the GPU)
+PUPPETEER_CACHE_DIR=.chrome npx puppeteer browsers install chrome-headless-shell@stable  # lighter, software GL
+```
+
+The launcher picks the right GPU flags per OS (`d3d11` on Windows, `gl` on Linux when
+`/dev/dri` exists, `swiftshader` when it does not) and uses headless-shell's own mode when
+that build is selected. In a container, set `CHROME_NO_SANDBOX=1` (or pass `--no-sandbox`).

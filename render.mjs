@@ -8,30 +8,93 @@
 //   (--loop also works with --sheet, where the times are loop time)
 import puppeteer from 'puppeteer-core';
 import { spawn } from 'node:child_process';
-import { mkdirSync, writeFileSync, existsSync, statSync, renameSync, readdirSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { mkdirSync, writeFileSync, existsSync, statSync, renameSync, readdirSync, readFileSync } from 'node:fs';
+import { dirname, resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { homedir } from 'node:os';
 
 const args = Object.fromEntries(process.argv.slice(2).map(a => { const [k, v] = a.replace(/^--/, '').split('='); return [k, v ?? true]; }));
-const CHROME = args.chrome || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
-const DUR = 156.6, fps = +(args.fps || 24);
+
+// ---------- locate a Chrome/Chromium binary (any OS) ----------
+const isWin = process.platform === 'win32';
+const hasGPU = existsSync('/dev/dri/renderD128');
+const EXE = new Set(isWin ? ['chrome.exe'] : ['chrome', 'chrome-headless-shell', 'chromium', 'google-chrome']);
+
+function walkFor(dir, depth = 5) {
+  if (depth < 0 || !existsSync(dir)) return [];
+  let out = [];
+  try {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) out = out.concat(walkFor(p, depth - 1));
+      else if (EXE.has(e.name)) out.push(p);
+    }
+  } catch { /* unreadable dir */ }
+  return out;
+}
+
+function findChrome(explicit) {
+  if (explicit) return explicit;
+  const env = process.env.CHROME || process.env.CHROME_PATH || process.env.PUPPETEER_EXECUTABLE_PATH;
+  if (env) return env;
+  const system = isWin
+    ? ['C:/Program Files/Google/Chrome/Application/chrome.exe', 'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe']
+    : ['/usr/bin/google-chrome-stable', '/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser', '/snap/bin/chromium'];
+  // look for a local .chrome/ here and up to 3 parent dirs (song folders sit under songs/<name>/)
+  const cached = [...walkFor(join(homedir(), '.cache/puppeteer'))];
+  let dir = process.cwd();
+  for (let i = 0; i < 4; i++) {
+    cached.push(...walkFor(join(dir, '.chrome')));
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  const all = [...system.filter(existsSync), ...cached];
+  if (!all.length) return null;
+  // no GPU: prefer the headless shell (light, no GPU process); GPU present: prefer full Chrome
+  const shell = all.find(p => p.includes('headless-shell'));
+  const full = all.find(p => !p.includes('headless-shell'));
+  return hasGPU ? (full || shell) : (shell || full);
+}
+
+const CHROME = findChrome(args.chrome);
+if (!CHROME) {
+  console.error('找不到 Chrome/Chromium。请安装，或用 --chrome=<路径> / CHROME=<路径> 指定。');
+  process.exit(1);
+}
+const IS_SHELL = /headless-shell/.test(CHROME);
+// optional per-project settings: { duration, fps, audio, out }
+let CFG = {};
+try { CFG = JSON.parse(readFileSync('song.config.json', 'utf8')); } catch { /* no config: use the defaults */ }
+const DUR = +(CFG.duration ?? 156.6), fps = +(args.fps || CFG.fps || 24);
+const AUDIO = CFG.audio || 'assets/pdoom.mp3';
 const FRAMES_DIR = 'out/frames';
 
 const run = (cmd, a) => new Promise((ok, bad) => { const p = spawn(cmd, a, { stdio: 'inherit' }); p.on('close', c => c ? bad(new Error(cmd + ' exited ' + c)) : ok()); });
 
 if (args.encode) {
-  const out = args.out || 'out/pdoom.mp4', n = readdirSync(FRAMES_DIR).filter(f => f.endsWith('.jpg')).length;
+  const out = args.out || CFG.out || 'out/pdoom.mp4', n = readdirSync(FRAMES_DIR).filter(f => f.endsWith('.jpg')).length;
   console.log(`encoding ${n} frames → ${out}`);
-  await run('ffmpeg', ['-y', '-loglevel', 'error', '-stats', '-framerate', String(fps), '-i', `${FRAMES_DIR}/f%05d.jpg`, '-i', 'assets/pdoom.mp3',
+  await run('ffmpeg', ['-y', '-loglevel', 'error', '-stats', '-framerate', String(fps), '-i', `${FRAMES_DIR}/f%05d.jpg`, '-i', AUDIO,
     '-map', '0:v', '-map', '1:a', '-c:v', 'libx264', '-preset', 'slow', '-crf', '17', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k',
     '-movflags', '+faststart', '-shortest', out]);
   console.log('wrote ' + out);
   process.exit(0);
 }
 
+// GPU flags differ per OS: d3d11 on Windows, GL/ANGLE on Linux, SwiftShader as the last resort.
+const GL_ARGS = isWin ? ['--use-angle=d3d11']
+  : hasGPU ? ['--use-angle=gl']
+    : ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'];
+const SANDBOX_ARGS = (args['no-sandbox'] || process.env.CHROME_NO_SANDBOX === '1' || (process.getuid?.() === 0))
+  ? ['--no-sandbox', '--disable-dev-shm-usage'] : [];
+
+console.log(`chrome: ${CHROME}\n  headless=${IS_SHELL ? 'shell' : 'new'}  gpu=${hasGPU ? '/dev/dri' : 'software'}  ${isWin ? 'win32' : process.platform}`);
+
 const browser = await puppeteer.launch({
-  executablePath: CHROME, headless: true, protocolTimeout: 0,
-  args: ['--allow-file-access-from-files', '--ignore-gpu-blocklist', '--use-angle=d3d11', '--enable-gpu-rasterization', '--window-size=1920,1080', '--disable-renderer-backgrounding', '--disable-background-timer-throttling']
+  executablePath: CHROME, headless: IS_SHELL ? 'shell' : true, protocolTimeout: 0,
+  args: ['--allow-file-access-from-files', '--ignore-gpu-blocklist', '--enable-gpu-rasterization', '--window-size=1920,1080',
+    '--disable-renderer-backgrounding', '--disable-background-timer-throttling', ...GL_ARGS, ...SANDBOX_ARGS]
 });
 async function openPage(tag = '') {
   const page = await browser.newPage();
@@ -98,7 +161,7 @@ if (args.sheet) {
   const [a, b] = args.clip ? String(args.clip).split(':').map(Number) : [0, DUR];
   const out = args.out || 'out/clip.mp4'; mkdirSync(dirname(out), { recursive: true });
   const ff = spawn('ffmpeg', ['-y', '-loglevel', 'error', '-f', 'image2pipe', '-framerate', String(fps), '-c:v', 'mjpeg', '-i', '-',
-    '-ss', String(a), '-t', String(b - a), '-i', 'assets/pdoom.mp3',
+    '-ss', String(a), '-t', String(b - a), '-i', AUDIO,
     '-map', '0:v', '-map', '1:a', '-c:v', 'libx264', '-preset', 'medium', '-crf', '19', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-shortest', out],
     { stdio: ['pipe', 'inherit', 'inherit'] });
   const n = Math.round((b - a) * fps), start = Date.now();

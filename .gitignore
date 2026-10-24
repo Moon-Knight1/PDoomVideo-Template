@@ -1,3 +1,14 @@
 node_modules/
 out/
 assets/source.mp4
+
+# local render toolchain (downloaded Chrome, npm cache)
+.chrome/
+.npmcache/
+.chrome-profile/
+.tmp/
+
+# per-song template symlinks to the root node_modules (a symlink is not a directory,
+# so the "node_modules/" rule above does not catch it)
+songs/*/node_modules
+songs/*/out/
